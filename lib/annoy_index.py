@@ -23,7 +23,7 @@ from functools import partial
 from typing import List
 
 from lib.tensor_sketch import SketchParams, TS
-from lib.tensor_embedding import TE
+from lib.tensor_sketch import TE
 
 from lib.vector_sketch import info, encode_seq, unique, get_num_lines, read_query_file, read_reference_file
 
