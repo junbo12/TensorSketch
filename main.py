@@ -65,8 +65,6 @@ def classify_csv(filepath, th=math.inf):
     missr = 0 if miss_num == 0 else missr/miss_num
     return query_num, fpr, fnr, missr
 
-
-
 def build_Vec(filename, vectorizer=tensor_sketch, indextype = 'annoy', w: int = 120, o:int = 100, sketch_dim: int = 16, rebuild=True, wf=False):
     
     idx = RefIdx(filename = filename, vectorizer = vectorizer,sketchdim = sketch_dim, w=w, o=o, index=indextype, rebuild=rebuild,  wf=wf)
@@ -103,31 +101,6 @@ def build_MH(filename, subseq_len: int = 3, indextype = 'annoy', w: int = 120, o
     total_time = time.time() - start_time
     return idx, total_time
 
-def eval(filename, fread_file, subseq_len, indextype, w_list, s_list, rebuild= True, wf=False, sketch_dim = 16, th=math.inf):
-
-    outfile = '/cluster/scratch/junbzhang/out/ts_{}_{}.csv'.format(indextype, subseq_len)
-    res = np.zeros((len(w_list),len(s_list)))
-    res_fnr = np.zeros((len(w_list),len(s_list)))
-    build_table = [ ['']*len(s_list)for _ in range(len(w_list))]
-    query_table = [ ['']*len(s_list)for _ in range(len(w_list))]
-    for i,w in enumerate(w_list):
-        for j,s in enumerate(s_list):
-            idx, build_time = build_TS(filename, subseq_len = subseq_len, indextype = indextype, w = w, o = w-s, rebuild=rebuild, wf=wf, tensor_sketch_dim = sketch_dim)
-            start_time = time.time()
-            idx.query_file(fread_file, outfile, check_correct=True, frac=1.0, ws=False)
-            query_time = time.time() - start_time
-            del idx
-            build_table[i][j] = str(datetime.timedelta(seconds=round(build_time)))
-            query_table[i][j] = str(datetime.timedelta(seconds=round(query_time)))
-            gc.collect()
-            #query_num, uniq_r, fpr, match_r , neigh_r= get_score_csv(outfile)
-            _, fpr, fnr = classify_csv(outfile,th)
-            res[i][j] = fpr
-            res_fnr[i][j] = fnr
-            print('finished', subseq_len, w, s)
-    
-    return res, build_table, query_table, res_fnr
-
 def table_to_csv(table, file_path,file_name):
     filepath = '{}/{}.csv'.format(file_path, file_name)
     with open(filepath,'w') as f:
@@ -142,32 +115,6 @@ def write_to_csv(data, file_path, file_name):
     with open(filepath,'a+') as f:
         f.write(data)
     return 
-
-def table_to_excel(res, file_path, file_name, sheet_name, subseq_len, row = 0, col = 0, index = [], columns = []):
-        filepath = '{}/{}.xlsx'.format(file_path, file_name)
-        first_time = False
-        
-        if not os.path.isfile(filepath):
-            df_empty = pd.DataFrame()
-            df_empty.to_excel(filepath)
-            first_time = True
-            
-        workbook = openpyxl.load_workbook(filepath)
-        
-        if first_time and not (sheet_name in workbook.sheetnames):
-            ex_sheet = workbook['Sheet1']
-            ex_sheet.title = sheet_name
-            workbook.save(filepath)
-        workbook.close()
-        
-        with pd.ExcelWriter(filepath, engine='openpyxl', mode='a', if_sheet_exists='overlay') as writer: 
-            df = pd.DataFrame(res, index = index, columns = columns)
-            df.to_excel(writer, sheet_name=sheet_name, startrow = row, startcol = col)
-        workbook = openpyxl.load_workbook(filepath)
-        worksheet = workbook[sheet_name]
-        worksheet.cell(row=row+1, column = col+1).value = 't = {}'.format(subseq_len)
-        workbook.save(filepath)
-        workbook.close()
 
 class FloatRange(object):
             def __init__(self, start: float, end: float):
@@ -198,7 +145,6 @@ if __name__ == '__main__':
     parser.add_argument('-T', '--tmp_prefix', default='scratch/out')
     parser.add_argument('-B', '--rebuild_index', action='store_false')
     args = parser.parse_args()
-    #subseq_len, indextype, w, o, tensor_sketch_dim
     reference_file = args.file_path_ref + '/' + args.reference_file
     query_file = args.file_path_query + '/' + args.query_file
     vectorizer = args.vectorizer
@@ -212,11 +158,7 @@ if __name__ == '__main__':
     tmp_prefix = args.tmp_prefix
     rebuild = args.rebuild_index
 
-    excel_name = '{}_{}'.format(index_type,vectorizer)
-    sheetname = '{}_{}'.format(kmer_len,sketch_dim)
-    offset = 0
-
-
+    csv_name = '{}_{}_param_analysis'.format(index_type, vectorizer)
     
     out_file  =  '{}/{}_{}_({},{},{},{}).csv'.format(tmp_prefix,index_type, vectorizer, sketch_dim, kmer_len,window,stride)
 
@@ -225,16 +167,12 @@ if __name__ == '__main__':
     query_time = idx.query_file(query_file, out_file, check_correct=True, frac=1.0, ws=False)
     query_num, fpr, fnr, missr = classify_csv(out_file)
 
-    def format_time(num):
-        tmp = str(datetime.timedelta(seconds=round(num,2))).split('.')
-        print(num)
-        return tmp[0]+ '.' + tmp[1][:2]
-
+    
     vectorizing_time = round(vectorizing_time, 2)
     build_time = round(build_time, 2)
     query_time = round(query_time, 2)
     str_row = '{},{},{},{},{},{},{},{},{}\n'.format(sketch_dim,kmer_len, window, stride, fpr, missr, vectorizing_time, build_time, query_time)
-    csv_name = '{}_{}_param_analysis'.format(index_type, vectorizer)
+    
     write_to_csv(str_row, out_prefix, csv_name)
     
     

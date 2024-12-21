@@ -10,7 +10,7 @@ def get_ref(record):
     return tmp2[0]
 
 
-ref_count = 5
+ref_count = 10
 read_count = 1000
 max_ref_size = 500000
 flag = False

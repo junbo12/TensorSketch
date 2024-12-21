@@ -1,5 +1,5 @@
 import lib.vector_sketch as vs
-from lib.tensor_embedding import TE
+from lib.tebns import TE
 from lib.base import *
 from collections import namedtuple
 import pandas as pd
