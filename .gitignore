@@ -1,0 +1,14 @@
+# ignore ALL .log files
+*.log
+*.csv
+
+# dont add .venv
+.venv/
+__pycache__/
+.idea/
+scratch/
+
+scratch.ipynb
+plots.ipynb
+debug.py
+
