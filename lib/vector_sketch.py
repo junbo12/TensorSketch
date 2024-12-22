@@ -75,8 +75,8 @@ def seq2kmers(encseq: np.ndarray, K: int = 3) -> np.ndarray:
 
 
 class RefIdx:
-    def __init__(self, filename: str, index='annoy', vectorizer: Vectorizer = None,
-                 w: int = 100, o: int = 80, sketchdim: int = 0, rebuild: bool = False, wf: bool = True, n_trees=16):
+    def __init__(self, filename: str, index, vectorizer: Vectorizer,
+                 w: int, o: int, sketchdim: int, rebuild: bool, wf: bool, build_threads=8, n_trees=16):
         """
         Creates an index of the reference sequences
         :param filename: reference file
@@ -97,6 +97,7 @@ class RefIdx:
         self.vectorizing_time = -1
         self.build_time = -1
         self.n_trees = n_trees
+        self.build_threads = build_threads
         if sketchdim <= 0:
             self.sketcher = None
         else:
@@ -104,7 +105,7 @@ class RefIdx:
             self.sketcher = SparseRandomProjection(random_state=rng, n_components=self.d)
         if index == 'annoy':
             self.t = AnnoyIndex(self.d, "euclidean")
-            self.build_annoy_index(filename, rebuild)
+            self.build_annoy_index(filename, rebuild, build_threads)
         elif index == 'usearch':
             dt = np.float32 if sketchdim > 0 else np.int8
             self.t = Index(ndim=self.d, dtype=dt, metric='ip', connectivity=16)
@@ -152,8 +153,8 @@ class RefIdx:
     
     #vectorizes references in parallel
 
-    def vectorize_references_par(self, filename):
-        nthreads = 8
+    def vectorize_references_par(self, filename, build_threads):
+        nthreads = build_threads
         readQueue = PQueue(maxsize=2 * nthreads)
         writeQueue = PQueue(maxsize=nthreads)
         seqQueue = PQueue(maxsize=2 * nthreads)
@@ -182,7 +183,7 @@ class RefIdx:
         
         return vectors
     
-    def build_annoy_index(self, filename: str, rebuild: bool = False):
+    def build_annoy_index(self, filename: str, rebuild: bool = False, build_threads=8):
         assert self.index == 'annoy'
         assert isinstance(self.t, annoy.AnnoyIndex)
 
@@ -195,17 +196,17 @@ class RefIdx:
                 self.ref_dict = pickle.load(fp)
             info('done.')
         else:
-            starttime = time.time()
-            vectors = self.vectorize_references_par(filename)
-            self.vectorizing_time = time.time() - starttime
-            starttime = time.time()
+            vec_start = time.time()
+            vectors = self.vectorize_references_par(filename, build_threads)
+            self.vectorizing_time = time.time() - vec_start
+            build_start= time.time()
             info("Adding items to annoy index..")
             for i in tqdm(range(len(vectors)), mininterval=60):
                 self.t.add_item(i, vectors[i])
             del vectors
             info("Building index..")
-            self.t.build(n_trees=self.n_trees, n_jobs=16)
-            self.build_time = time.time() - starttime
+            self.t.build(n_trees=self.n_trees, n_jobs=2*build_threads)
+            self.build_time = time.time() - build_start
             if self.wf:
                 info('Writing index to file..')
                 filename = filename + '_({},{},{},{})'.format(self.vectorizer.name, self.sketchdim, self.w, self.stride)
@@ -255,7 +256,7 @@ class RefIdx:
         Summarize matches for windows into a single tuple containing (1) the name of the closest reference,
         (2) distance from this reference, and (3) whether this reference was the closest in all windows over the query.
         :param matches: a list of 4-tuples - (ref_name, distance, read_offset, ref_offset)
-        :return: a 5-tuple - (ref-name, distance, unique, read_offset, ref_offset)
+        :return: a 4-tuple - (ref-name, distance, read_offset, ref_offset)
         """
         
         
@@ -266,46 +267,25 @@ class RefIdx:
 
             if all(x == ref_names[0] for x in ref_names):
                 # return the average distance
-                return ref_names[0], sum(dists) / len(matches), True, matches[0][2], matches[0][3]
+                return ref_names[0], sum(dists) / len(matches), matches[0][2], matches[0][3]
             
             else:
                 # return the smallest distance
                 matches = sorted(matches, key=lambda x: x[1])
-                return matches[0][0], matches[0][1], False, matches[0][2], matches[0][3]
-        return '', math.inf, False, -1, -1
-    @staticmethod
-    def summarize_scores_annoy(matches: list) -> tuple:
-        
-        
-        ref_names = [el[0] for el in matches]
-        dists = [el[1] for el in matches]
-        if len(matches) > 0:
-            # check if the matches are all with the same reference
-
-            if all(x == ref_names[0] for x in ref_names):
-                # return the average distance
-                return ref_names[0], sum(dists) / len(matches)
-            
-            else:
-                # return the smallest distance
-                matches = sorted(matches, key=lambda x: x[1])
-                return matches[0][0], matches[0][1]
-        return '', math.inf
-    
+                return matches[0][0], matches[0][1], matches[0][2], matches[0][3]
+        return '', math.inf, -1, -1
     
     def query_window_check(self, q: str, target_refname = '', n_nearest = 1,fac=2) -> tuple:
             assert (self.w - self.o) <= len(q) <= (self.w + self.o)
             v = self.vectorizer.func(q)
             if self.index == 'annoy':
                 
-                ids, distances = self.t.get_nns_by_vector(v, n_nearest, search_k = fac*self.t.get_n_trees(), include_distances=True)
+                ids, distances = self.t.get_nns_by_vector(v, n_nearest, search_k = int(fac*self.t.get_n_trees()), include_distances=True)
                 #search_k parameter
                 name_off_list = [self.refs[x] for x in ids]
                 concat_list = list(map(lambda x, y:(x[0],y,x[1]), name_off_list, distances))
                 name, distance, offset = concat_list[0]
-
-                is_close = (target_refname in [x[0] for x in name_off_list])
-                return name, offset, distance, is_close
+                return name, offset, distance
             elif self.index == 'faiss':
                 v = np.array([v])
                 if self.sketcher:
@@ -316,7 +296,7 @@ class RefIdx:
                 name_off_list = [self.refs[x] for x in ids[0]]
                 is_close = (target_refname in [x[0] for x in name_off_list])
                 name, offset = name_off_list[0]
-                return name, offset, distances[0][0], is_close
+                return name, offset, distances[0][0]
             else:
                 assert False, ('Not implemented')
     
@@ -329,18 +309,15 @@ class RefIdx:
         """
         matches = []
         read_offset = 0
-        neighboring = 0
         assert self.w <= len(q)
         while read_offset + self.w <= len(q):
-            name, ref_offset, dist, is_close = self.query_window_check(q[read_offset:read_offset + self.w], target_refname,n_nearest=1,fac=fac)
+            name, ref_offset, dist = self.query_window_check(q[read_offset:read_offset + self.w], target_refname,n_nearest=1,fac=fac)
             
             matches.append((name,dist,read_offset, ref_offset))
-            if (is_close):
-                neighboring += 1
 
             read_offset += 1
         
-        ref_name,dist,_, read_offset, ref_offset = self.summarize_scores(matches)
+        ref_name,dist, read_offset, ref_offset = self.summarize_scores(matches)
         
         read_seq = []
         if(ws):
@@ -372,7 +349,7 @@ class RefIdx:
                     
                     if is_in_pool:
                         th=10
-                        nearest_distance = read_offset%(self.w-self.o)
+                        nearest_distance = (true_offset + read_offset)%(self.w-self.o)
                         true_distance = min([math.dist(self.vectorizer.func(self.ref_dict[target_refname][1][true_offset+read_offset+i:true_offset+read_offset+self.w+i*nearest_distance]),
                                                     self.vectorizer.func(seq[read_offset+i:read_offset+self.w+i*nearest_distance])) for i in range(-th,th+1) if i*nearest_distance < th])
                     
@@ -392,8 +369,8 @@ class RefIdx:
                        
                         seq_queue.put((desc,true_ref,match_ref,read_seq))
                 else:
-                    refname, distance, _, _, _ = self.query(seq)
-                    write_queue.put("{},{}\n".format(distance, refname))
+                    refname, distance, _, _, _ = self.query_found(seq)
+                    write_queue.put("{},{},{}\n".format(refname, distance, int(refname == target_refname)))
         info('Worker exiting.')
 
     @staticmethod
@@ -405,8 +382,8 @@ class RefIdx:
         return ref_name, start
     
 
-    def query_file(self, infile, outfile, frac=1.0, check_correct=True, ws = False, fac = 2):
-        nthreads =8 
+    def query_file(self, infile, outfile, frac=1.0, check_correct=True, ws = False, query_threads = 8, fac = 2):
+        nthreads = query_threads
         info("Querying")
         readQueue = PQueue(maxsize=4 * nthreads)
         writeQueue = TQueue(maxsize=4 * nthreads)
@@ -435,7 +412,7 @@ class RefIdx:
                 #f.write('distance, correct, is_in_pool, unique, occurence_matching, occurence_querying, read_offset, matched_offset, true_offset\n')
                 f.write('distance, true_distance, correct, is_in_pool, read_offset, matched_offset, true_offset\n')
             else:
-                f.write('distance,refname\n')
+                f.write('distance,refname, correct\n')
 
             n_threads_remaining = nthreads
             with tqdm(total=n_lines, mininterval=60) as pbar:

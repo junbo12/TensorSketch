@@ -4,7 +4,6 @@
 
 # dont add .venv
 .venv/
-__pycache__/
 .idea/
 scratch/
 

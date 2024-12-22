@@ -10,10 +10,11 @@ def get_ref(record):
     return tmp2[0]
 
 
-ref_count = 10
-read_count = 1000
-max_ref_size = 500000
+ref_count = 40
+read_count = 20000
+max_ref_size = 4e6
 flag = False
+
 
 input_ref = "scratch/data/bacteria_1g_a.fasta"
 input_read= "scratch/data/bacteria_1g_a_basecalled_r9.fasta"
@@ -26,20 +27,32 @@ output_id = "scratch/data/id.txt"
 ref_fa = [r for r in SeqIO.parse(input_ref, "fasta") if len(r.seq) < max_ref_size]
 if(len(ref_fa)>ref_count):
     ref_fa = random.sample(ref_fa, ref_count)
+avg_len = 0
+ref_count = 0
 for r in ref_fa:
-    print(len(r.seq))
+    len_seq = len(r.seq)
+    print(len_seq)
+    avg_len += len_seq
+    ref_count += 1
+print('avg len: ', int(avg_len/ref_count))
 count_ref = SeqIO.write(ref_fa, output_ref, 'fasta-2line')
 
 print("Saved %i random records from %s to %s" % (count_ref, input_ref, output_ref))
 
 
-
+avg_read = 0
+read_count = 0
 ref_id = [r.id for r in ref_fa]
 read_fa =  [r for r in SeqIO.parse(input_read, "fasta") if get_ref(r) in ref_id]
 if len(read_fa)> read_count:
     read_fa = random.sample(read_fa, read_count)
 if(flag):
     read_fa = read_fa + (random.sample([r for r in SeqIO.parse(input_read2, "fasta")], read_count))
+for r in read_fa:
+    len_seq = len(r.seq)
+    avg_read += len_seq
+    ref_count += 1
+print(avg_read/read_count)
 count_read = SeqIO.write(read_fa, output_read, 'fasta-2line')
 
 print("Saved %i random records from %s to %s" % (count_read, input_read, output_read))
