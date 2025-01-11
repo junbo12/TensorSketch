@@ -1,13 +1,13 @@
 import lib.vector_sketch as vs
-from lib.tensor_sketch import TE
+from lib.vectorizations import TE
 from lib.base import *
 from collections import namedtuple
 import pandas as pd
 import openpyxl
 from annoy import AnnoyIndex
 import numba as nb
-from lib.tensor_sketch import TS
-from lib.tensor_sketch import MH
+from lib.vectorizations import TS
+from lib.vectorizations import MH
 from hashlib import sha1
 import math
 import Levenshtein

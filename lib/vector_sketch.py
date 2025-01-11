@@ -1,32 +1,24 @@
 import os
 
-import annoy
-import math
-
-import numpy as np
-import usearch.index
-from numba import jit, njit, prange
+from math import dist
+import sys
 import pyfastx
-from sklearn.random_projection import SparseRandomProjection
-import faiss
 from datetime import datetime as dt
 from annoy import AnnoyIndex
-from usearch.index import Index
+import random
 from tqdm import tqdm
 import pickle
-from threading import Thread
-from queue import Queue as TQueue
+from multiprocessing import Array as PArray
+from multiprocessing import Value as PValue
 from multiprocessing import Process
 from multiprocessing import Queue as PQueue
-import random
 from collections import namedtuple
 import time
-
+from threading import Thread
+import psutil
+import numpy as np
+from fast_edit_distance import edit_distance
 # sys.path.append(os.path.abspath('.'))
-
-#debug
-from memory_profiler import profile
-
 
 Vectorizer = namedtuple('Vectorizer', ['func', 'name'])
 
@@ -49,34 +41,9 @@ def get_num_lines(filename: str) -> int:
     return num_lines
 
 
-
-@njit
-def seq2kmers(encseq: np.ndarray, K: int = 3) -> np.ndarray:
-    """
-    A vector of k-mers from a sequence
-    :param encseq: encoded sequence
-    :return: vector of kmers (encoded into integers)
-    """
-    
-    RADIX = 4
-    D = RADIX ** K
-    M1 = D // RADIX
-    if encseq.shape[0] < K:
-        return None
-    v = np.empty((encseq.shape[0] - K + 1,), dtype=np.int16)  # we will not have k-mers longer than 8
-    v[0] = 0
-    for i in range(K):
-        v[0] = ((v[0] * RADIX) + encseq[i])
-    for i in prange(1, encseq.shape[0] - K + 1):
-        outgoing = encseq[i - 1]
-        incoming = encseq[i + K - 1]
-        v[i] = ((v[i - 1] - M1 * outgoing) * RADIX) + incoming
-    return v
-
-
 class RefIdx:
-    def __init__(self, filename: str, index, vectorizer: Vectorizer,
-                 w: int, o: int, sketchdim: int, rebuild: bool, wf: bool, build_threads=8, n_trees=16):
+    def __init__(self, filename: str, tmp_directory,index, vectorizer: Vectorizer, sketchdim: int,
+                 w: int, s: int, n_trees, rebuild: bool, on_disk:bool, dict_flag:bool,write_flag:bool, build_threads, prefault):
         """
         Creates an index of the reference sequences
         :param filename: reference file
@@ -86,67 +53,188 @@ class RefIdx:
         :param rebuild: if true, rebuild the index even though an index was found in the current directory
         :param sketchdim: if greater than 0, sketch the vector into this dimension
         """
+        random.seed(42)
+        self.id = time.time()*1000
+        self.dict_flag = dict_flag
+        self.prefault = prefault
+        self.on_disk = on_disk
         self.w = w
-        self.o = o
-        self.vectorizer = vectorizer if vectorizer is not None else None
-        self.refs = []
+        self.s = s
+        self.write_flag = write_flag
+        self.vectorizer = vectorizer 
+        self.arr_hash = None
+        self.arr_offset = None
         self.ref_dict = {}
+        self.hash_dict = None
         self.index = index
         self.d = sketchdim 
-        self.wf = wf
-        self.vectorizing_time = -1
-        self.build_time = -1
+        self.t = None
+        
         self.n_trees = n_trees
-        self.build_threads = build_threads
-        if sketchdim <= 0:
-            self.sketcher = None
-        else:
-            rng = np.random.RandomState(42)
-            self.sketcher = SparseRandomProjection(random_state=rng, n_components=self.d)
+        self.n_items = 0
+
+        self.tmp_directory = tmp_directory
+        self.filepath = ''
+        self.outputname =''
+        
+        self.ref_num = 0
+        self.avg_ref_size =0
+
+        self.build_time = -1
+        self.vectorizing_time = -1
+        self.total_pss = 0
+
         if index == 'annoy':
-            self.t = AnnoyIndex(self.d, "euclidean")
-            self.build_annoy_index(filename, rebuild, build_threads)
-        elif index == 'usearch':
-            dt = np.float32 if sketchdim > 0 else np.int8
-            self.t = Index(ndim=self.d, dtype=dt, metric='ip', connectivity=16)
-            self.build_usearch_index(filename, rebuild)
-        elif index == 'faiss':
-            quantizer = faiss.IndexFlatL2(self.d)
-            self.t = faiss.IndexIVFFlat(quantizer, self.d, 100)
-            self.build_faiss_index(filename, rebuild)
+            self.t = AnnoyIndex(self.d,'euclidean')
+            self.t.set_seed(42)
+            vectorizing_time, build_time = self.build_annoy_index(filename, rebuild, build_threads)
+            self.vectorizing_time = vectorizing_time
+            self.build_time = build_time 
         else:
             assert False, "Not implemented"
+
+    def build_annoy_index(self, filename: str, rebuild: bool = False, build_threads=8):
         
-    
+
+        if not rebuild and os.path.exists(filename + '.annoy') and os.path.exists(filename + '.refmap') and os.path.exists (filename + '.refdict'):
+            load_time = time.time()
+            info("Loading annoy index from disk..")
+            self.t.load(filename + '.annoy', prefault = self.prefault)
+            self.n_items = self.t.get_n_items()
+            self.n_trees = self.t.get_n_trees()
+            with open(filename + '.ref_hash', 'rb') as fp:
+                self.arr_hash = pickle.load(fp)
+            with open(filename + '.ref_offset', 'rb') as fp:
+                self.arr_offset = pickle.load(fp)
+            with open(filename + '.hash_dict', 'rb') as fp:
+                self.hash_dict = pickle.load(fp)
+            with open(filename + '.refdict', 'rb') as fp:
+                self.ref_dict = pickle.load(fp)
+            print('loaded in',time.time()-load_time)
+
+            info('done.')
+        else:
+            proc = psutil.Process()
+
+            print('before vectorizing',proc.memory_full_info())
+            info("Adding items to annoy index..")
+
+            if os.path.exists(self.tmp_directory):
+                print('tmp_directory')
+                self.filepath = self.tmp_directory
+                self.outputname = self.filepath +'/{}.annoy'.format(self.vectorizer)
+            else:
+                self.outputname = filename +'_{}.annoy'.format(self.vectorizer)
+            
+            if self.on_disk:
+                self.t.on_disk_build(self.outputname)  
+            
+            num_items =0
+            gen = self.vectorize_references_par(filename, build_threads)
+            
+            hash_dict = {}
+            arr_offset = []
+            arr_hash = []
+            vec_start = time.time()
+            for offsets,vectors,name,hash_name in gen:
+                
+                hash_time = time.time()
+                arr_hash.extend(np.full(len(offsets),hash_name))
+                arr_offset.extend(offsets)
+                hash_dict[hash_name]=name
+                print('hash_time', time.time()-hash_time)
+                add_time = time.time()
+                for vector in vectors:
+                    
+                    self.t.add_item(num_items,vector)
+
+                    num_items +=1
+                print('add_time',time.time()-add_time)   
+
+                print('np size', vectors.nbytes)  
+                sys.stdout.flush() 
+            self.n_items = num_items
+            self.hash_dict = hash_dict
+            self.arr_hash = np.array(arr_hash,dtype=np.int32)
+            self.arr_offset = np.array(arr_offset,dtype=np.int32)
+            self.num_items=num_items
+            vectorizing_time = time.time() - vec_start
+            build_start= time.time()
+            
+
+            self.total_pss= max(proc.memory_full_info().pss, self.total_pss)
+            print('after vectorizing and adding',proc.memory_full_info())
+
+            info("Building index..{}".format(self.n_trees))
+            self.t.build(n_trees=self.n_trees, n_jobs=2*build_threads)
+            
+            self.total_pss = max(proc.memory_full_info().pss, self.total_pss)
+            print('after build ',proc.memory_full_info())
+            
+            info('Writing index to file.. ' + self.filepath)
+            
+            
+            if (self.on_disk):
+                self.t.unload()
+                self.t.load(self.outputname,prefault=False)
+            else:
+                self.t.save(self.outputname,prefault=False)
+            if self.write_flag:
+                if not os.path.exists(filename+'.annoy',):
+                    self.t.save(filename+'.annoy',prefault=False)
+                
+                with open(filename+ '.ref_hash', 'wb') as fp:
+                    pickle.dump(self.arr_hash, fp, protocol=pickle.HIGHEST_PROTOCOL)
+                with open(filename+ '.hash_dict', 'wb') as fp:
+                    pickle.dump(self.hash_dict, fp, protocol=pickle.HIGHEST_PROTOCOL)
+                with open(filename+ '.ref_offset', 'wb') as fp:
+                    pickle.dump(self.arr_offset, fp, protocol=pickle.HIGHEST_PROTOCOL)
+                if self.dict_flag:
+                    with open(filename + '.refdict', 'wb') as fp:
+                      pickle.dump(self.ref_dict, fp, protocol=pickle.HIGHEST_PROTOCOL)
+                
+            
+            build_time = time.time() - build_start
+            
+            print('after saving',proc.memory_full_info())
+            
+            self.total_pss = max(proc.memory_full_info().pss, self.total_pss)
+
+            info("Done.")
+            
+        return vectorizing_time, build_time
+
     @staticmethod
-    def vectorize_sequence_par(read_queue: PQueue, write_queue: PQueue, w: int, o: int, vectorizer: Vectorizer, seq_queue:PQueue):
-        keys = []
-        
-        vectors = []
-        dict_list= {}
+    def vectorize_sequence_par(read_queue: PQueue, write_queue: PQueue, w: int, s: int, vectorizer: Vectorizer):
         while True:
+            
+            offsets = [] 
+            vectors = []
             name, seq = read_queue.get()
+            hash_name = np.int32(hash(name)& 0xFFFFFFFF)
             if name == 'END':
+
                 read_queue.put((name, seq))
-                seq_queue.put(dict_list)
-                write_queue.put((keys,vectors))
+
+                write_queue.put((0,0,0,'END'))
                 break
             else:
                 
                 length = len(seq)
-                dict_list[name]= (length,seq)
                 if length >= w:
-                    offset = 0
+                    offset = np.int32(0)
                     while offset + w <= length:
-                        keys.append((name, offset))
+                        offsets.append(offset)
                         vectors.append(vectorizer.func(seq[offset:offset + w]))
-                        offset += (w - o)
-                     
+                        
+                        offset += s
+                    
                     if 2*(length-offset) >= w: #if the remaining part is larger than half the window size, then add it to the vectors
                         offset = length-w
-                        vectors.append(vectorizer.func(seq[offset:length])) 
-                        keys.append((name, offset))  
-            print('vectorized', name, length)
+                        vectors.append(vectorizer.func(seq[offset:offset + w]))
+                        offsets.append(offset)  
+
+            write_queue.put((np.array(offsets),np.array(vectors),name,hash_name))
             
         info('Worker exiting.')
 
@@ -154,102 +242,56 @@ class RefIdx:
     #vectorizes references in parallel
 
     def vectorize_references_par(self, filename, build_threads):
+
+        info(f'vectorizing with {build_threads}')
+
         nthreads = build_threads
-        readQueue = PQueue(maxsize=2 * nthreads)
-        writeQueue = PQueue(maxsize=nthreads)
-        seqQueue = PQueue(maxsize=2 * nthreads)
+        readQueue = PQueue(maxsize=4 * nthreads)
+        writeQueue = PQueue(maxsize=2 * nthreads)
+        reader_thread =Thread(target=self.read_reference_file, args=(filename, readQueue,self.dict_flag))
+        reader_thread.start()
         
         worker_threads = []
         for _ in range(nthreads):
             worker_thread = Process(target=RefIdx.vectorize_sequence_par,
-                                    args=(readQueue, writeQueue, self.w, self.o, self.vectorizer, seqQueue))
+                                    args=(readQueue, writeQueue, self.w, self.s, self.vectorizer))
             worker_threads.append(worker_thread)
             worker_thread.start()
-        reader_thread = Process(target=read_reference_file, args=(filename, readQueue))
-        reader_thread.start()
-        
-        vectors = []
-        for i in range(nthreads):
-            t_keys, t_vectors = writeQueue.get()
-            self.refs.extend(t_keys)
-            vectors.extend(t_vectors)
-            new_dict = seqQueue.get()
-            self.ref_dict.update(new_dict)
+        finished = 0
+        while True:
+            offsets, t_vectors,name,hash_name = writeQueue.get()    
+            if hash_name == 'END': 
+                finished+=1
+                if finished == nthreads:
+                    break
+            else:      
+                yield (offsets,t_vectors,name,hash_name)
+
         reader_thread.join()
 
         for worker in worker_threads:
             worker.join()
-            
-        
-        return vectors
     
-    def build_annoy_index(self, filename: str, rebuild: bool = False, build_threads=8):
-        assert self.index == 'annoy'
-        assert isinstance(self.t, annoy.AnnoyIndex)
+    def read_reference_file(self, infile: str, queue: PQueue,dict_flag):
+        info("reading reference file {}".format(infile))
+        ref_num = 0
+        avg_ref_size =0
+        for name, seq in pyfastx.Fasta(infile, build_index=False):
+            len_seq = len(seq)
+            if len_seq>=self.w:
+                if(dict_flag):
+                    self.ref_dict[name]=(len_seq, seq)
+                
+                queue.put((name, seq))
+                avg_ref_size += len_seq
+            
+            ref_num += 1
 
-        if not rebuild and os.path.exists(filename + '.annoy') and os.path.exists(filename + '.refmap'):
-            info("Loading annoy index from disk..")
-            self.t.load(filename + '.annoy')
-            with open(filename + '.refmap', 'rb') as fp:
-                self.refs = pickle.load(fp)
-            with open(filename + '.refdict', 'rb') as fp:
-                self.ref_dict = pickle.load(fp)
-            info('done.')
-        else:
-            vec_start = time.time()
-            vectors = self.vectorize_references_par(filename, build_threads)
-            self.vectorizing_time = time.time() - vec_start
-            build_start= time.time()
-            info("Adding items to annoy index..")
-            for i in tqdm(range(len(vectors)), mininterval=60):
-                self.t.add_item(i, vectors[i])
-            del vectors
-            info("Building index..")
-            self.t.build(n_trees=self.n_trees, n_jobs=2*build_threads)
-            self.build_time = time.time() - build_start
-            if self.wf:
-                info('Writing index to file..')
-                filename = filename + '_({},{},{},{})'.format(self.vectorizer.name, self.sketchdim, self.w, self.stride)
-                self.t.save(filename + '.annoy')
-                with open(filename + '.refmap', 'wb') as fp:
-                    pickle.dump(self.refs, fp, protocol=pickle.HIGHEST_PROTOCOL)
-                with open(filename + '.refdict', 'wb') as fp:
-                    pickle.dump(self.ref_dict, fp, protocol=pickle.HIGHEST_PROTOCOL)
-            info("Done.")
-
-    def build_faiss_index(self, filename: str, rebuild: bool = False):
-        assert self.index == 'faiss'
-        assert isinstance(self.t, faiss.IndexIVFFlat)
-        if not rebuild and os.path.exists(filename + '.faiss') and os.path.exists(filename + '.refmap'):
-            info("Loading faiss index from disk..")
-            self.t = faiss.read_index(filename + '.faiss')
-            with open(filename + '.refmap', 'rb') as fp:
-                self.refs = pickle.load(fp)
-            info('done.')
-        else:
-            vectors = self.vectorize_references_par(filename)
-            info("Building faiss index..")
-            matrix = np.vstack(vectors, dtype=np.float32)
-            info("Created a matrix of shape {} and type {}".format(matrix.shape, matrix.dtype))
-
-            if self.sketcher:
-                info("Transforming data..")
-                ref_matrix_new = self.sketcher.fit_transform(matrix)
-                matrix = np.array(ref_matrix_new, dtype=np.float32)
-                info("Obtained matrix of shape {} and type {}".format(ref_matrix_new.shape, ref_matrix_new.dtype))
-
-            info('Training index..')
-            self.t.train(matrix)
-            info("Adding vectors to index..")
-            self.t.add(matrix)
-            if self.wf:
-                info('Writing index to file..')
-                faiss.write_index(self.t, filename + '.faiss')
-                with open(filename + '.refmap', 'wb') as fp:
-                    pickle.dump(self.refs, fp, protocol=pickle.HIGHEST_PROTOCOL)
-            info("Done.")
-        self.t.nprobe = 1
-
+        self.ref_num = ref_num
+        self.avg_ref_size = int(avg_ref_size/ref_num)
+        queue.put(('END', 0))
+        info('Reader exiting.')
+    
     @staticmethod
     def summarize_scores(matches: list) -> tuple:
         """
@@ -258,217 +300,267 @@ class RefIdx:
         :param matches: a list of 4-tuples - (ref_name, distance, read_offset, ref_offset)
         :return: a 4-tuple - (ref-name, distance, read_offset, ref_offset)
         """
-        
-        
-        ref_names = [el[0] for el in matches]
-        dists = [el[1] for el in matches]
         if len(matches) > 0:
-            # check if the matches are all with the same reference
+            # return the smallest distance
+            matches = sorted(matches, key=lambda x: x[1])
+            return matches[0][0], matches[0][1], matches[0][2], matches[0][3]
+        return '', -1, -1, -1
 
-            if all(x == ref_names[0] for x in ref_names):
-                # return the average distance
-                return ref_names[0], sum(dists) / len(matches), matches[0][2], matches[0][3]
+    
+    @staticmethod
+    def query_window_check(q: str,t, w,s, vec_func, arr_hash, arr_offset, search_fac) -> tuple:
+            assert s <= len(q) <= (2*w - s)
+
+            vec_time = time.time()
+            v = vec_func(q)
+            vec_time = time.time()-vec_time
+
+            index_time = time.time()
             
-            else:
-                # return the smallest distance
-                matches = sorted(matches, key=lambda x: x[1])
-                return matches[0][0], matches[0][1], matches[0][2], matches[0][3]
-        return '', math.inf, -1, -1
-    
-    def query_window_check(self, q: str, target_refname = '', n_nearest = 1,fac=2) -> tuple:
-            assert (self.w - self.o) <= len(q) <= (self.w + self.o)
-            v = self.vectorizer.func(q)
-            if self.index == 'annoy':
-                
-                ids, distances = self.t.get_nns_by_vector(v, n_nearest, search_k = int(fac*self.t.get_n_trees()), include_distances=True)
-                #search_k parameter
-                name_off_list = [self.refs[x] for x in ids]
-                concat_list = list(map(lambda x, y:(x[0],y,x[1]), name_off_list, distances))
-                name, distance, offset = concat_list[0]
-                return name, offset, distance
-            elif self.index == 'faiss':
-                v = np.array([v])
-                if self.sketcher:
-                    sv = self.sketcher.transform(v)
-                    v = np.array(sv, dtype=np.float32)
-                distances, ids = self.t.search(v, n_nearest)
-
-                name_off_list = [self.refs[x] for x in ids[0]]
-                is_close = (target_refname in [x[0] for x in name_off_list])
-                name, offset = name_off_list[0]
-                return name, offset, distances[0][0]
-            else:
-                assert False, ('Not implemented')
-    
-    def query_found(self, q: str, target_refname: str, ws: bool =False, fac=2):
-        """
-        Return the distance between the query string and the closest segment in the reference
-        :param q: the query string
-        :return: a summary of scores consisting of (1) the name of the closest reference,
-        (2) distance from this reference, and (3) whether this reference was the closest in all windows over the query
-        """
+            ids, distances = t.get_nns_by_vector(v, 1, search_k = max(int(search_fac*t.get_n_trees()),1), include_distances=True)
+            index_time = time.time()-index_time
+            
+            name_hash = arr_hash[ids[0]]
+            offset = arr_offset[ids[0]]
+            distance = distances[0]
+            
+            return name_hash, offset, distance, vec_time, index_time
+   
+    @staticmethod
+    def query_found(q: str,t, vec_func, w,s, arr_hash,arr_offset, ws, read_stride, search_fac,hash_dict):
+        
+        
+        
+        read_offset =0
         matches = []
-        read_offset = 0
-        assert self.w <= len(q)
-        while read_offset + self.w <= len(q):
-            name, ref_offset, dist = self.query_window_check(q[read_offset:read_offset + self.w], target_refname,n_nearest=1,fac=fac)
-            
-            matches.append((name,dist,read_offset, ref_offset))
+        len_q = len(q)
+        total_vec_time =0 
+        total_index_time=0
+        
+        #query at least once 
+        first = min(w, len(q))
+        name_hash, ref_offset, dist,vec_time,index_time = RefIdx.query_window_check(q[read_offset:read_offset + first],t,w,s,vec_func,arr_hash,arr_offset,search_fac)
+        total_vec_time += vec_time
+        total_index_time += index_time          
+        matches.append((name_hash,dist,read_offset, ref_offset))
+        read_offset += read_stride
+        
+        while read_offset + w <= len_q:
+            name_hash, ref_offset, dist,vec_time,index_time = RefIdx.query_window_check(q[read_offset:read_offset + first],t,w,s,vec_func,arr_hash,arr_offset,search_fac)
+            total_vec_time += vec_time
+            total_index_time += index_time
+            matches.append((name_hash,dist,read_offset, ref_offset))
 
-            read_offset += 1
+            read_offset += read_stride
         
-        ref_name,dist, read_offset, ref_offset = self.summarize_scores(matches)
         
-        read_seq = []
+        refname_hash,dist, read_offset, ref_offset = RefIdx.summarize_scores(matches)
+        read_seq = None
         if(ws):
-            read_seq = q[read_offset:read_offset + self.w]
-        
-        return ref_name, dist, read_offset, ref_offset,read_seq
+            read_seq = q[read_offset:read_offset + w]
+        return hash_dict[refname_hash], dist, read_offset, ref_offset,read_seq, total_vec_time, total_index_time
     
-    def query_thread(self, read_queue: PQueue, write_queue: TQueue, check_correct: bool = True, seq_queue = None, fac=2):
+    @staticmethod
+    def query_thread(idx_path,read_queue: PQueue, write_queue: PQueue,sketch_dim, vec_func, arr_hash,arr_offset,ref_dict,hash_dict,check_correct,w,s, eer=0.1,seq_queue = None, vec_t=None, index_t=None,mem_t=None,prefault=False,read_stride=1, search_fac=2):
+        t = AnnoyIndex(sketch_dim,'euclidean')     
+        
+        t.load(idx_path,prefault=prefault) #use annoys mmap to share the index
+        ws = (seq_queue is not None)
         while True:
+            
             name, seq = read_queue.get()
             if name == 'END':
                 read_queue.put((name, seq))
                 write_queue.put("X")
-                if(seq_queue is not None):
+                if ws:
                     seq_queue.put('X')
                 break
             else:
+
+                target_refname, read_name,true_offset = split_query_header(name)
+
                 if check_correct:
-                    ws=seq_queue is not None
+                    assert ref_dict, 'check_correct not allowed when ref_dict not built'
+
+                    refname, distance, read_offset, ref_offset, read_seq,total_vec_time, total_index_time = RefIdx.query_found(seq,t,vec_func,w,s,arr_hash,arr_offset,ws,read_stride,search_fac,hash_dict)
+
                     
-                    target_refname, true_offset = self.split_query_header(name)
-                   
-                    #refname, distance, uniq, occ, neighboring_score, read_offset, ref_offset, read_seq = self.query_found(seq, target_refname,ws)
-                    refname, distance, read_offset, ref_offset, read_seq = self.query_found(seq, target_refname,ws,fac=fac)
-                    is_in_pool = int(target_refname in self.ref_dict.keys())
-                    if (not is_in_pool):
-                        print('not in pool query found')
+                    is_in_pool = int(target_refname in ref_dict.keys())
                     true_distance = -1
-                    
+                    edit_dist = -1
+                    match_edit_dist = -1
+                    th=int(eer*100)
                     if is_in_pool:
-                        th=10
-                        nearest_distance = (true_offset + read_offset)%(self.w-self.o)
-                        true_distance = min([math.dist(self.vectorizer.func(self.ref_dict[target_refname][1][true_offset+read_offset+i:true_offset+read_offset+self.w+i*nearest_distance]),
-                                                    self.vectorizer.func(seq[read_offset+i:read_offset+self.w+i*nearest_distance])) for i in range(-th,th+1) if i*nearest_distance < th])
-                    
-                    '''
+                        bruteforce_check = False
+                        match_edit_dist = edit_distance(seq[read_offset:read_offset+w],ref_dict[refname][1][ref_offset:ref_offset+w],max_ed=2*(int(th))) 
+                        if bruteforce_check:#bruteforce check the true vector sketch distance and edit distance
+                            len_seq = len(seq)
+                            true_distance = min([dist(vec_func(ref_dict[target_refname][1][i:i+w]),vec_func(seq[j:j+w])) for j in range(0,len_seq-w+1,read_stride) for i in range(max(0,true_offset-th*s),min(ref_dict[target_refname][0],true_offset+len_seq-w+1+th*s),s)])
+                            edit_dist = min([edit_distance(ref_dict[target_refname][1][i:i+w],seq[j:j+w]) for j in range(0,len_seq-w+1,read_stride) for i in range(max(0,true_offset-th*s),min(ref_dict[target_refname][0],true_offset+len_seq-w+1+th*s),s)])
+                        else:#soft check
+                            stride = s
+                            nearest_distance = (true_offset + read_offset)%stride
+                            nearest_offset = true_offset+read_offset-nearest_distance
+                            true_distance = min([dist(vec_func(ref_cdt),vec_func(read_cdt)) for i in range(-th,th+1)  if abs(i*stride) <= th 
+                                                and len(ref_cdt:=ref_dict[target_refname][1][nearest_offset+i*stride:max((nearest_offset+i*stride)+w,0)])==w  
+                                                    and len(read_cdt:=seq[read_offset:read_offset+w])==w])
+                            edit_dist = min([edit_distance(ref_cdt,read_cdt,max_ed=2*(int(th))) for i in range(-th,th+1)  if abs(i*stride) <= th 
+                                                and len(ref_cdt:=ref_dict[target_refname][1][nearest_offset+i*stride:max((nearest_offset+i*stride)+w,0)])==w  
+                                                    and len(read_cdt:=seq[read_offset:read_offset+w])==w])
                     write_queue.put("{},{},{},{},{},{},{},{},{}\n".format(
-                        distance, int(refname == target_refname), is_in_pool, int(uniq), occ, neighboring_score, read_offset, ref_offset, true_offset+read_offset
+                        distance, true_distance, int(refname == target_refname), is_in_pool, read_offset, ref_offset, true_offset+read_offset,match_edit_dist,edit_dist
                     ))
-                    '''
-                    write_queue.put("{},{},{},{},{},{},{}\n".format(
-                        distance, true_distance, int(refname == target_refname), is_in_pool, read_offset, ref_offset, true_offset+read_offset
-                    ))
-                    if(ws):
-                        desc =  "{},{},{},{},{},{}".format(target_refname, refname,  refname == target_refname, true_offset+read_offset, ref_offset, read_offset)
-                        true_ref = self.ref_dict[target_refname][1][true_offset+read_offset:true_offset+read_offset+self.w]
-                        match_ref =  self.ref_dict[refname][1][ref_offset:ref_offset+self.w]
+                   
+                    if ws:
+                        desc =  "{},{},{},{},{},{}".format(target_refname, ref_dict[refname], refname == target_refname, true_offset+read_offset, ref_offset, read_offset)
+                        true_ref = ref_dict[target_refname][1][true_offset+read_offset:true_offset+read_offset+w]
+                        match_ref = ref_dict[refname][1][ref_offset:ref_offset+w]
                         
                        
                         seq_queue.put((desc,true_ref,match_ref,read_seq))
                 else:
-                    refname, distance, _, _, _ = self.query_found(seq)
-                    write_queue.put("{},{},{}\n".format(refname, distance, int(refname == target_refname)))
+                    target_refname, _ = split_query_header(name)
+                    refname, distance, _, _, _ = RefIdx.query_found(seq,t,vec_func,w,s,arr_hash,arr_offset,ws,read_stride,search_fac)
+                    write_queue.put("{},{},{},{}\n".format(read_name,refname, distance, int(refname == target_refname)))
+            
+            vec_t.value += total_vec_time
+            index_t.value += total_index_time
+        mem_t.value=psutil.Process().memory_full_info().pss
         info('Worker exiting.')
 
-    @staticmethod
-    def split_query_header(header: str):
-        substr1 = header.split('!')[1]
-        tokens = substr1.split(':')
-        ref_name = tokens[0]
-        start = int(tokens[1].split('-')[0])
-        return ref_name, start
-    
+    def query_file(self, infile, outfile, check_correct=True, query_frac=1.0,search_fac = 2, read_stride=1,eer=0.01, ws = False, prefault=False, query_threads = 8):
+        pid = os.getpid()
+        proc = psutil.Process(pid)
+        cpu_num = proc.cpu_num()
+        
+        print('main before',pid, cpu_num,proc.memory_full_info())
 
-    def query_file(self, infile, outfile, frac=1.0, check_correct=True, ws = False, query_threads = 8, fac = 2):
+        if self.dict_flag:          
+            ref_dict  = self.ref_dict           
+        else:
+            ref_dict = None
+            
+        hash_dict = self.hash_dict 
+        arr_hash = PArray('i',self.arr_hash,lock=False)
+        arr_offset = PArray('i',self.arr_offset,lock=False)
+        
+        val_query_num = PValue('i')
+        val_avg_query_size = PValue('i')
         nthreads = query_threads
-        info("Querying")
-        readQueue = PQueue(maxsize=4 * nthreads)
-        writeQueue = TQueue(maxsize=4 * nthreads)
-        seqQueue = TQueue(maxsize=4 * nthreads)
-        n_lines = get_num_lines(infile) // 2
+        vec_t  = [PValue('f',0.0,lock=False) for _ in range (nthreads)]
+        index_t  = [PValue('f',0.0,lock=False) for _ in range (nthreads)]   
+        mem_t  = [PValue('f',0.0,lock=False) for _ in range (nthreads)]   
+        readQueue = PQueue(maxsize= 10 * nthreads)
+        writeQueue = PQueue(maxsize= 8 * nthreads)
+        if ws:
+            seqQueue = PQueue(maxsize= 8 * nthreads)
+        else:
+            seqQueue = None
+        
         worker_threads = []
-        reader_thread = Process(target=read_query_file, args=(infile, frac, readQueue, self.w))
+        query_num = 0
+        info("Querying with {} threads".format(query_threads))
+        
+        
+        start_time = time.time()
+        
+        reader_thread = Process(target=read_query_file, args=(infile, query_frac, readQueue, self.w,val_query_num,val_avg_query_size))
         reader_thread.start()
-        starttime = time.time()
         for i in range(nthreads):
-            if (ws):
-                worker_thread = Thread(target=self.query_thread, args=(readQueue, writeQueue, check_correct, seqQueue, fac))
-            else:    
-                worker_thread = Thread(target=self.query_thread, args=(readQueue, writeQueue, check_correct,None, fac))
+            
+            worker_thread = Process(target=RefIdx.query_thread, args=(self.outputname,readQueue, writeQueue,self.d, self.vectorizer.func, arr_hash,arr_offset, ref_dict,hash_dict, check_correct,self.w,self.s, eer, seqQueue,vec_t[i],index_t[i],mem_t[i],prefault,read_stride,search_fac))
             worker_threads.append(worker_thread)
             worker_thread.start()
-
-        if(ws):
+        
+        if ws:
             tmp = outfile.split('.')[0]
-            
             filename = tmp+'_seq.csv'
-            seq_thread = Thread(target=write_file, args=(filename, seqQueue,nthreads))
+            seq_thread = Process(target=RefIdx.write_file, args=(filename, seqQueue,nthreads))
             seq_thread.start()
+
         with open(outfile, 'w') as f:
             if check_correct:
                 #f.write('distance, correct, is_in_pool, unique, occurence_matching, occurence_querying, read_offset, matched_offset, true_offset\n')
-                f.write('distance, true_distance, correct, is_in_pool, read_offset, matched_offset, true_offset\n')
+                f.write('distance, true_distance, correct, is_in_pool, read_offset, matched_offset, true_offset,ed,true_ed\n')
             else:
-                f.write('distance,refname, correct\n')
-
+                f.write('name,refname,distance,correct\n')
+            avg_write_time = 0
             n_threads_remaining = nthreads
+            n_lines = get_num_lines(infile) // 2
             with tqdm(total=n_lines, mininterval=60) as pbar:
                 while n_threads_remaining:
+                    write_time = time.time()
                     stat = writeQueue.get()
                     if stat[0] == 'X':
                         n_threads_remaining -= 1
                     else:
-                        
                         f.write(stat)
                         pbar.update(1)
+
+                    avg_write_time += time.time() - write_time
+               
+        
         reader_thread.join()
-        if(ws):
-            seq_thread.join()
         for i in range(nthreads):
             worker_threads[i].join()
+        if ws :
+            seq_thread.join()
+        query_num = val_query_num.value
+
+        avg_query_size = val_avg_query_size.value
+        print('avg write time', avg_write_time/query_num)
+        total_pss = proc.memory_full_info().pss  
+        total_pss += sum([val.value for val in mem_t])
+        total_vec_time = sum([val.value for val in vec_t])/query_threads
+        total_index_time = sum([val.value for val in index_t])/query_threads
+
+        
+        print('main after',pid, cpu_num,proc.memory_full_info())
         info('Done.')
-        return time.time()-starttime
+        return query_num, avg_query_size, time.time()-start_time, total_vec_time, total_index_time, total_pss
 
-def read_reference_file(infile: str, queue: PQueue):
-    info("reading reference file {}".format(infile))
-    ref_dict = {}
-    for name, seq in pyfastx.Fasta(infile, build_index=False):
-        ref_dict[name]=(len(seq), seq)
-        
-        queue.put((name, seq))
-        
-
-    queue.put(('END', ''))
-    info('Reader exiting.')
-
-def write_file(filename, seq_queue: TQueue, nthreads):
-        with open(filename, 'w') as f:
-            f.write('true_ref,match_ref,correct,true_ref_off,match_ref_off,read_off\n')
-            while nthreads:
-                stat = seq_queue.get()
-                
-                if stat[0][0] == 'X':
-                        nthreads -= 1
-                       
-                else:
+    @staticmethod
+    def write_file(filename, seq_queue: PQueue, nthreads):
+            with open(filename, 'w') as f:
+                f.write('true_ref,match_ref,correct,true_ref_off,match_ref_off,read_off\n')
+                while nthreads:
+                    stat = seq_queue.get()
                     
-                    f.write(stat[0]+'\n')
-                    f.write(stat[1]+'\n')
-                    f.write(stat[2]+'\n')
-                    f.write(stat[3]+'\n')   
+                    if stat[0][0] == 'X':
+                            nthreads -= 1
+                    else:       
+                        f.write(stat[0]+'\n')
+                        f.write(stat[1]+'\n')
+                        f.write(stat[2]+'\n')
+                        f.write(stat[3]+'\n')   
+#S1_45!NC_004719.1:74975-75374!0!400!+@45[194]
+def split_query_header(header: str):
+    substr1 = header.split('!')[1]
+    tokens = substr1.split(':')
+    ref_name = tokens[0]
+    start = int(tokens[1].split('-')[0])
+    return ref_name,  header.split('!')[0],start
 
-def read_query_file(infile: str, frac: float, queue: PQueue, w):
+
+def read_query_file(infile: str, frac: float, queue: PQueue, w, val_query_num, val_avg_query_size):
+    query_num = 0
+    avg_query_size = 0
     if frac > 1.0:
         frac = 1.0
     info("reading query file {}".format(infile))
     for name, seq in pyfastx.Fasta(infile, build_index=False):
+        
         if random.random() < frac:
             if len(seq) > 200:
+                avg_query_size += 200
                 queue.put((name, seq[:200]))
             elif (len(seq)>=w):
                 queue.put((name, seq))
+                avg_query_size += len(seq)
+            query_num += 1
+
     queue.put(('END', ''))
+    val_query_num.value = query_num
+    val_avg_query_size.value = int(avg_query_size/query_num)
     info('Reader exiting.')
+    return query_num, avg_query_size
