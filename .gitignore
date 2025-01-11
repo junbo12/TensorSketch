@@ -9,4 +9,7 @@ scratch/
 
 scratch.ipynb
 plots.ipynb
+__pycache_
+t.py
+filter_same.py
 
