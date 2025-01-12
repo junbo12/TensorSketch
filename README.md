@@ -51,8 +51,8 @@ Notes:
 Query header assumes to be of the form S1_45!NC_004719.1:74975-75374!0!400!+@45[194], where S1_45 is the query name, NC_004719.1 being the true reference name and 74975-75374 being the offset start and offset end.
 Zymo has the header S1_349!tig00000306!118409!118719!+ but I've rewritten the header using filter_newdataset.ipynb. If you have other headers you might need to change the split_query_header function found in lib/annoy_index.py
 
-Calling main.py will jsut call build and query functions in the main.py, that has additional checks like if Tensor Embedding received the correct sketch dimension=4^kmer length. It has similar paramteres but query has 2 additional parameters eer and read_stride. eer stands for expected error of the queries which has default value 0.1 and read_stride is the stride you use to slide through the windows for the queries. Default is 1.
+Calling main.py will just call build and query functions in the main.py, that has additional checks like if Tensor Embedding received the correct sketch dimension=4^kmer length. It has similar paramteres but query has 2 additional parameters eer and read_stride. eer stands for expected error of the queries which has default value 0.1 and read_stride is the stride you use to slide through the windows for the queries. Default is 1.
 
-
+You might find filter_random.py useful for filtering a large dataset of refernce file and query file for testing.
 
 
