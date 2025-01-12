@@ -11,7 +11,6 @@ from multiprocessing import cpu_count
 # sys.path.append(os.path.abspath('.'))
 Vectorizer = namedtuple('Vectorizer', ['func', 'name'])
 
-
 #distance, true_distance, correct, is_in_pool, read_offset, matched_offset, true_offset   
 def classify(filepath, th=math.inf):
     with open(filepath,'r') as f:
@@ -213,10 +212,7 @@ if __name__ == '__main__':
     #query_max_mem, ret_val = memory_usage(proc=(query,(),{'idx':idx,'query_file': query_file, 'query_threads': query_threads, 'out_file':out_file, 'check_correct':check_correct, 
     #                           'frac': 1.0, 'ws': False}),interval=.5, include_children=True, multiprocess=True, max_usage=True,retval=True)
 
-    
     query_num, avg_query_size, fpr, fnr, missr,edr,query_time,total_vec_time,total_index_time,total_pss = query(idx,query_file,output_file, check_correct, query_frac, search_fac,1,0.1,ws,prefault, query_threads)
-
-    
     query_max_mem = total_pss 
     print(f'query_num: {query_num}, avg query size:{avg_query_size}, false positive rate: {fpr}, query_per_sec{query_num/query_time},query_time: {query_time:.2f},index_time: {total_index_time:.3f},vec_time: {total_vec_time:.3f},query_mem_usage: {query_max_mem:.2f}MB')
     str_row = f'{n_trees},{search_fac},{sketch_dim},{kmer_len},{window},{stride},{fpr},{missr},{edr},{build_time + vectorizing_time},{ref_max_mem},{query_num/query_time},{query_time},{total_vec_time},{total_index_time},{query_max_mem}\n'
