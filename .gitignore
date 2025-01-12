@@ -7,6 +7,8 @@
 .idea/
 scratch/
 
+eval_offset.ipynb
+eval.ipynb
 scratch.ipynb
 plots.ipynb
 __pycache_

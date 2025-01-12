@@ -3,8 +3,8 @@ import datetime
 import argparse
 from collections import namedtuple
 import math
-from lib.tensor_embedding import TS, MH, TE, KS
-from lib.vector_sketch2 import RefIdx
+from lib.vectorizations import TS, MH, TE, KS
+from lib.annoy_index import RefIdx
 from lib.base import SketchParams
 import os
 from multiprocessing import cpu_count
@@ -14,78 +14,54 @@ Vectorizer = namedtuple('Vectorizer', ['func', 'name'])
 
 #distance, true_distance, correct, is_in_pool, read_offset, matched_offset, true_offset   
 def classify(filepath, th=math.inf):
-    if check_correct:
-        with open(filepath,'r') as f:
+    with open(filepath,'r') as f:
 
-            reader = csv.reader(f)
-            l = [row for row in reader]
-            data = [[float(el) for el in row] for row in l[1:]]
+        reader = csv.reader(f)
+        l = [row for row in reader]
+        data = [[float(el) for el in row] for row in l[1:]]
+        
+        
+        tp = 0
+        fp = 0 
+        tn = 0
+        fn = 0
+        missr = 0
+        edr=0
+        miss_num = 0
+        for row in data:
             
-            
-            tp = 0
-            fp = 0 
-            tn = 0
-            fn = 0
-            missr = 0
-            edr=0
-            miss_num = 0
-            for row in data:
-                
-                dist = row[0]
-                ed=row[7]
-                true_ed = row[8]
-                correct = int(row[2])
-                is_in_pool = bool(int(row[3]))
+            dist = row[0]
+            ed=row[7]
+            true_ed = row[8]
+            correct = int(row[2])
+            is_in_pool = bool(int(row[3]))
 
-                if is_in_pool and not correct:
-                    true_dist = row[1]
-                    miss_num += 1
-                    if true_ed<ed:
-                        edr+=1
-                    if true_dist < dist:
-                        missr += 1
+            if is_in_pool and not correct:
+                true_dist = row[1]
+                miss_num += 1
+                if true_ed<ed:
+                    edr+=1
+                if true_dist < dist:
+                    missr += 1
 
-                if (dist<=th):
-                    if is_in_pool:
-                        tp += correct
-                        fp += 1-correct
-                    else:
-                        fn += 1
-
+            if (dist<=th):
+                if is_in_pool:
+                    tp += correct
+                    fp += 1-correct
                 else:
-                    if(is_in_pool):
-                        fp +=1
-                    else:
-                        tn += 1
+                    fn += 1
 
-        fpr = -1 if tp+fp==0 else fp/(tp+fp)
-        fnr = -1 if tn+fn==0 else fn/(tn+fn)
-        missr = 0 if miss_num == 0 else missr/miss_num
-        edr = 0 if miss_num == 0 else edr/miss_num
-        return fpr, fnr, missr,edr
-    else:
-        with open(filepath,'r') as f:
-
-            reader = csv.reader(f)
-            l = [row[:4] for row in reader]
-            data = [[str(row[0]), str(row[1]),float(row[2]), int(row[3])] for row in l[1:]]
-            
-            
-            tp = 0
-            fp = 0 
-            for row in data:
-                correct = row[2]
-                if correct:
-                    tp +=1
+            else:
+                if(is_in_pool):
+                    fp +=1
                 else:
-                    fp += 1
+                    tn += 1
 
-
-        fpr = -1 if tp+fp==0 else fp/(tp+fp)
-        fnr = -1
-        missr = -1
-        edr=-1
-        return fpr, fnr, missr,edr
+    fpr = -1 if tp+fp==0 else fp/(tp+fp)
+    fnr = -1 if tn+fn==0 else fn/(tn+fn)
+    missr = 0 if miss_num == 0 else missr/miss_num
+    edr = 0 if miss_num == 0 else edr/miss_num
+    return fpr, fnr, missr,edr
 
 
 def build(filename, tmp_directory, rebuild, vectorizer, kmer_len, sketch_dim, index_type, window=20,stride=2,n_trees=32, dict_flag=True, on_disk=False, write_flag=True,prefault=True, build_threads = cpu_count()):
@@ -124,9 +100,13 @@ def build(filename, tmp_directory, rebuild, vectorizer, kmer_len, sketch_dim, in
 def query(idx:RefIdx, query_file, out_file,check_correct=True,query_frac=1.0,search_fac=2,read_stride=1,eer=0.1,ws=False, prefault=False, query_threads=8):
     
     query_num, avg_query_size, query_time,total_vec_time,total_index_time,total_pss = idx.query_file(query_file, out_file,check_correct, query_frac, search_fac,read_stride,eer,ws,prefault,query_threads)
-    fpr, fnr,missr,edr = classify(out_file, check_correct)   
+    if check_correct:
+        fpr, fnr,missr,edr = classify(out_file)  
+        return query_num, avg_query_size, fpr, fnr, missr, edr,query_time, total_vec_time, total_index_time,total_pss 
+    else:
+        return query_num, avg_query_size, -1, -1,-1, -1,query_time, total_vec_time, total_index_time,total_pss 
     
-    return query_num, avg_query_size, fpr, fnr, missr, edr,query_time, total_vec_time, total_index_time,total_pss
+
 
 def write_to_csv(row, file_path, file_name):
     filepath = '{}/{}.csv'.format(file_path, file_name)
@@ -153,30 +133,35 @@ class FloatRange(object):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('-FR', '--file_path_ref', default = '/cluster/scratch/junbzhang/data')
-    parser.add_argument('-R', '--reference_file', default = 'filter_random_ref.fasta')
-    parser.add_argument('-FQ', '--file_path_query', default = '/cluster/scratch/junbzhang/data')
-    parser.add_argument('-TMP', '--tmp_directory', default = './tmp')
-    parser.add_argument('-Q', '--query_file', default = 'filter_random_read.fasta')
-    parser.add_argument('-V', '--vectorizer', choices=['kmer_pos','kmer_dist','tensor_sketching','tensor_embedding','min_hash_simple','min_hash'], default='tensor_sketch')
+    #build specific parameters
+    parser.add_argument('-PR', '--file_path_ref', default = './scratch/data')
+    parser.add_argument('-FR', '--reference_file', default = 'filter_random_ref.fasta')
+    parser.add_argument('-O', '--on_disk', action='store_false')
+    parser.add_argument('-R', '--rebuild_index', action='store_false')
+    parser.add_argument('-BT', '--build_threads', type=int, default=8)  
+    parser.add_argument('-Df', '--dict_flag', action='store_false')   
+    parser.add_argument('-Nt', '--n_trees', type=int, default=32)
+    parser.add_argument('-Wf', '--write_flag', action='store_true')
+
+    #used by both build and query
+    parser.add_argument('-V', '--vectorizer', choices=['kmer_pos','kmer_dist','tensor_sketch','tensor_embedding','min_hash_simple','min_hash'], default='tensor_sketch')
     parser.add_argument('-I', '--index_type', choices=['annoy'] ,default = 'annoy')
     parser.add_argument('-K', '--kmer_length', type=int, default=6)  
-    parser.add_argument('-D', '--sketch_dim', type=int, default=128)
+    parser.add_argument('-D', '--sketch_dim', type=int, default=64)
     parser.add_argument('-W', '--window_size', type=int, choices=range(10, 300), default=100)
     parser.add_argument('-S', '--stride', type=int, default=1)
+    parser.add_argument('-Pf', '--pre_fault', action='store_false')
+    parser.add_argument('-TMP', '--tmp_directory', default = './tmp')
+
+    #query specific arguments
+    parser.add_argument('-PQ', '--file_path_query', default = './scratch/data')
+    parser.add_argument('-FQ', '--query_file', default = 'filter_random_read.fasta')
     parser.add_argument('-F', '--query_frac', type=float, choices=[FloatRange(0.01, 1.0)], default=1.0)
-    parser.add_argument('-P', '--output_prefix', default='/cluster/scratch/junbzhang/out')
-    parser.add_argument('-B', '--rebuild_index', action='store_false')
-    parser.add_argument('-BT', '--build_threads', type=int, default=8)  
-    parser.add_argument('-QT', '--query_threads', type=int, default=8)  
-    parser.add_argument('-PF', '--pre_fault', action='store_false')
-    parser.add_argument('-WS', '--write_sequence', action='store_true')
+    parser.add_argument('-P', '--output_prefix', default='./scratch/out')
+    parser.add_argument('-QT', '--query_threads', type=int, default=8) 
     parser.add_argument('-C', '--check_correct', action='store_false')
-    parser.add_argument('-DF', '--dict_flag', action='store_false')
-    parser.add_argument('-Nt', '--n_trees', type=int, default=32)
     parser.add_argument('-Fn', '--fac_nearest', type=float, default=2.0)
-    parser.add_argument('-Wf', '--write_flag', action='store_true')
-    parser.add_argument('-O', '--on_disk', action='store_true')
+    parser.add_argument('-Ws', '--write_sequence', action='store_true')
     args = parser.parse_args()
     reference_name = args.reference_file
     reference_file = args.file_path_ref + '/' + reference_name
@@ -203,36 +188,40 @@ if __name__ == '__main__':
     write_flag = args.write_flag
     on_disk = args.on_disk
     ws =args.write_sequence
+    
     def format_time(num):
         print(num)
         tmp = str(datetime.timedelta(seconds=round(num,2))).split('.')
         return tmp[0]+ '.' + tmp[1][:2]
 
+    rebuild = False
+    write_flag = True
+    check_correct = True
 
     idx = build(reference_file,tmp_directory, rebuild, vectorizer, kmer_len, sketch_dim, index_type, window, stride,n_trees, dict_flag,on_disk, write_flag, prefault, build_threads)
-    #output_file  =  '{}/{}_{}.csv'.format(output_prefix,reference_name,idx.id)
-    output_file = f'./tensor_sketch3.csv'
+    
+    output_file  =  '{}/{}_{}.csv'.format(output_prefix,reference_name,idx.id)
 
     #ref_max_mem, idx = memory_usage(proc=(build, () ,{'filename': reference_file, 'build_threads': build_threads, 'vectorizer':vectorizer, 'index_type':index_type, 
     #                            'kmer_len': kmer_len, 'sketch_dim': sketch_dim, 'rebuild':rebuild, 'prefault':prefault, 'window':window,'stride':stride}),interval=.5, include_children=True, multiprocess=True, max_usage=True,retval=True)
     vectorizing_time = idx.vectorizing_time
     build_time = idx.build_time
-    ref_max_mem = idx.total_pss / 1000000
+    ref_max_mem = idx.total_pss
     print('ref num: {}, avg ref size: {}, num elements: {}'.format(idx.ref_num,idx.avg_ref_size, idx.n_items))
     print(f'vectorizing_time: {vectorizing_time:.2f}, build_time : {build_time:.2f}, max_mem_usage: {ref_max_mem:.2f}MB')
 
     #query_max_mem, ret_val = memory_usage(proc=(query,(),{'idx':idx,'query_file': query_file, 'query_threads': query_threads, 'out_file':out_file, 'check_correct':check_correct, 
     #                           'frac': 1.0, 'ws': False}),interval=.5, include_children=True, multiprocess=True, max_usage=True,retval=True)
-    #query_num, fpr, fnr, missr,query_time,avg_vec_time,avg_index_time = ret_val
-    
-    query_num, avg_query_size, fpr, fnr, missr,edr,query_time,total_vec_time,total_index_time,total_pss = query(idx,query_file,output_file, check_correct, query_frac, search_fac,1,0.1,ws,prefault, query_threads)
-    
-    #os.remove(output_file)
 
     
-    query_max_mem = total_pss / 1000000
+    query_num, avg_query_size, fpr, fnr, missr,edr,query_time,total_vec_time,total_index_time,total_pss = query(idx,query_file,output_file, check_correct, query_frac, search_fac,1,0.1,ws,prefault, query_threads)
+
+    
+    query_max_mem = total_pss 
     print(f'query_num: {query_num}, avg query size:{avg_query_size}, false positive rate: {fpr}, query_per_sec{query_num/query_time},query_time: {query_time:.2f},index_time: {total_index_time:.3f},vec_time: {total_vec_time:.3f},query_mem_usage: {query_max_mem:.2f}MB')
     str_row = f'{n_trees},{search_fac},{sketch_dim},{kmer_len},{window},{stride},{fpr},{missr},{edr},{build_time + vectorizing_time},{ref_max_mem},{query_num/query_time},{query_time},{total_vec_time},{total_index_time},{query_max_mem}\n'
+    
+    #write statistics into a specified csv file
     csv_name = '{}_{}_test'.format(index_type, vectorizer)
-    out_prefix = './eval/'
+    out_prefix = './scratch/eval/'
     write_to_csv(str_row, out_prefix, csv_name)

@@ -1,4 +1,4 @@
-import lib.vector_sketch as vs
+import lib.annoy_index as vs
 from lib.vectorizations import TE
 from lib.base import *
 from collections import namedtuple

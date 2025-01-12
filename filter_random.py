@@ -10,9 +10,9 @@ def get_ref(record):
     return tmp2[0]
 
 
-max_ref = 20
-max_read = 10000
-max_ref_size = 500000
+max_ref = 2
+max_read = 10
+max_ref_size = 100000
 flag = False
 
 input_ref = "./scratch/data/bacteria_1g_a.fasta"
