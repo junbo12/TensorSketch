@@ -53,6 +53,8 @@ Zymo has the header S1_349!tig00000306!118409!118719!+ but I've rewritten the he
 
 Calling main.py will just call build and query functions in the main.py, that has additional checks like if Tensor Embedding received the correct sketch dimension=4^kmer length. It has similar paramteres but query has 2 additional parameters eer and read_stride. eer stands for expected error of the queries which has default value 0.1 and read_stride is the stride you use to slide through the windows for the queries. Default is 1.
 
+Furthermore the query function requires a Vectorizer type argument which is just a namedtuple of the form (func: vectorizing function, name: arbitrary name). You can not pass out_prefix to the function argument outfile , as outfile requires filepath + csv name, an example is provided in main.py.
+
 You might find filter_random.py useful for filtering a large dataset of refernce file and query file for testing.
 
 
