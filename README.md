@@ -7,7 +7,7 @@ This is the code for the thesis paper "Tensor Sketch for Fast similary Search Us
 
 1. Clone the repo
    ```sh
-   git clone https://github.com/github_username/repo_name.git
+   git clone https://github.com/junbo12/tensorsketch.git
    ```
 2. Create new virutal Python environment and install the dependencies requirements.txt
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
