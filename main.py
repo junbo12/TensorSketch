@@ -193,9 +193,6 @@ if __name__ == '__main__':
         tmp = str(datetime.timedelta(seconds=round(num,2))).split('.')
         return tmp[0]+ '.' + tmp[1][:2]
 
-    rebuild = False
-    write_flag = True
-    check_correct = True
 
     idx = build(reference_file,tmp_directory, rebuild, vectorizer, kmer_len, sketch_dim, index_type, window, stride,n_trees, dict_flag,on_disk, write_flag, prefault, build_threads)
     
