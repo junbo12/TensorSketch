@@ -1,17 +1,12 @@
 # ignore ALL .log files
 *.log
 *.csv
-
+*.ipynb
 # dont add .venv
 .venv/
 .idea/
 scratch/
 
-eval_offset.ipynb
-eval.ipynb
-scratch.ipynb
-plots.ipynb
-__pycache__
 __pycache__
 t.py
 filter_same.py
